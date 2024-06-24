@@ -1,0 +1,1362 @@
+---
+title: "ROCOVE Effectiveness Report"
+author: "Holly Tibble"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = TRUE, echo = T, message=F,warning=F)
+library(tidyverse)
+library(MetBrewer)
+library(caret)
+library(janitor)
+library(labelled)
+library(kableExtra)
+library(lubridate)
+library(survival)
+library(survminer)
+library(Hmisc)
+```
+
+# Loading in Datasets
+
+```{r load_data}
+setwd("/conf/EAVE/GPanalysis")
+
+#SMR01 (hospitalisations)
+SMR01<-readRDS("data/SMR01_allstays.rds")
+
+# load in hospitalisations data
+hosp <- readRDS("data/automated_any_hospitalisation_post_01022020.rds")
+
+# Demographics
+demog<-readRDS("outputs/temp/Cohort_Demog_Endpoints_Dates2021-07-28.rds")
+
+# PCR testing data
+cdw <- readRDS("data/CDW_full.rds")
+
+# LFT Tests
+lfts <- readRDS("data/lft_positives.rds")
+
+# Vaccination Data
+vaccs <- readRDS("data/cleaned_data/C19vaccine_dvprod_cleaned.rds")
+
+# OPCS4 codes
+OPCS4<-readRDS("data/MAB_OPCS4_270922.rds") 
+
+# Q COVID Diagnoses
+Q<-readRDS("data/cleaned_data/QCOVID_feb22.rds")
+
+# PIS Extract for Immunotherapies
+PIS<-readRDS("data/PIS_MAB_0802_2022-09-27.rds")
+
+# Viral sequencing data
+sequencing<-readRDS("data/WGS_latest.rds") %>%
+  select(EAVE_LINKNO, Collection_Date, VariantShorthand, lineage) %>%
+  mutate(Collection_Date = as.Date(Collection_Date)) %>%
+  filter(!is.na(Collection_Date) &
+           Collection_Date >= as.Date("2021-12-01"))
+
+# Deaths
+deaths<-readRDS("data/all_deaths.rds")
+
+# ICU Episode Level
+ICUe<-readRDS("data/SICSAG_episode_level_.rds")
+
+# # ICU Daily Level
+# ICUd<-readRDS("data/SICSAG_daily_data_.rds")
+
+# Treatment Data
+hepma <- readRDS("data/HEPMA_mABsAVs_admin_ 2022-10-11 .rds")
+hepma2<-readRDS("data/HEPMA_mABsAVs_prescr_ 2022-10-11 .rds")
+PHSO <- readRDS("data/MABs_2022-09-27.rds")
+
+```
+
+```{r data_desc}
+max(SMR01$ADMISSION_DATE)
+max(cdw$date_ecoss_specimen)
+max(deaths$NRS.Date.Death)
+max(hosp$admission_date)
+max(ICUe$AdmitUnit)
+max(lfts$date_ecoss_specimen)
+max(PIS$prescribed_full_date)
+max(sequencing$Collection_Date)
+max(vaccs$vacc_occurence_date)
+
+```
+
+## Treatment Data Processing
+
+
+```{r combine_trt_data, warning=F}
+
+# Read in HEPMA Administration data
+hepma<-hepma %>%
+  mutate(Medication = str_to_title(drug_admin),
+         Treatment_Date = admin_given_date_time,
+         Treatment_Date=replace_na(scheduled_date)) %>%
+  select(EAVE_LINKNO,Medication,patient_HB,Treatment_Date)
+
+# Read in HEPMA Prescription data
+hepma2<-hepma2 %>%
+  mutate(Medication = str_to_title(drug_prescr),
+         Treatment_Date = prescr_date) %>%
+  select(EAVE_LINKNO,Medication,patient_HB,Treatment_Date) 
+
+# Merge HEPMA datasets together
+hepma <- hepma   %>%
+  bind_rows(hepma2) %>%
+  filter(!is.na(EAVE_LINKNO) & 
+           !Medication %in% c("Ronapreve","Baricitinib")) %>% 
+  distinct() %>%
+  filter(substr(patient_HB,1,3)=="NHS") %>%
+  mutate(health_board = str_to_title(substr(patient_HB,5,nchar(patient_HB)))) %>%
+  select(-patient_HB)
+
+hepma %>% group_by(health_board) %>% 
+  summarise(n=n(),enddate = max(Treatment_Date)) %>%
+  filter(n>50)
+rm(hepma2)
+hepma_max<-max(hepma$Treatment_Date)
+
+hepma_max
+nrow(hepma)
+length(unique(hepma$EAVE_LINKNO))
+hepma_max
+
+# Non-HEPMA data
+PHSO <- PHSO %>%
+  clean_names() %>%
+  filter(year(prescribed_date)>=2021) %>%
+  mutate(Medication = ifelse(str_detect(toupper(drug_prescribed),'SARILUMAB'),
+                             'Sarilumab',NA),
+         Medication = ifelse(str_detect(toupper(drug_prescribed),'TOCILIZUMAB'),
+                             'Tocilizumab',Medication),
+         Medication = ifelse(str_detect(toupper(drug_prescribed),'SOTROVIMAB'),
+                             'Sotrovimab',Medication),
+         Medication = ifelse(str_detect(toupper(drug_prescribed),'MOLNUPIRAVIR'),
+                             'Molnupiravir',Medication),
+         Medication = ifelse(str_detect(toupper(drug_prescribed),'MOLNUPAVIR'),
+                             'Molnupiravir',Medication),
+         Medication = ifelse(str_detect(toupper(drug_prescribed),'MOLNUPIRIVIR'),
+                             'Molnupiravir',Medication),
+         Medication = ifelse(str_detect(toupper(drug_prescribed),'LAGEVRIO'),
+                             'Molnupiravir',Medication),
+         Medication = ifelse(str_detect(toupper(drug_prescribed),'PAXLOVID'),
+                             'Paxlovid',Medication),
+         Medication = ifelse(str_detect(toupper(drug_prescribed),'REMDESIVIR'),
+                             'Remdesivir',Medication),
+         prescribed_date = if_else(prescribed_date<as.Date("2021-12-01"),
+                                   as.Date(prescribed_date + years(1)),
+                                   prescribed_date)) %>% 
+  filter(!is.na(Medication)) %>%
+  rename(EAVE_LINKNO = eave_linkno,
+         Treatment_Date = prescribed_date) %>%
+  filter(!is.na(EAVE_LINKNO) &
+           Treatment_Date<=hepma_max) %>%
+  select(-dosage, -drug_prescribed,-healthcare_setting) %>%
+  distinct() %>%
+  mutate(health_board = ifelse(health_board=="Ayshire & Arran",
+                               "Ayrshire & Arran",health_board)) 
+
+nrow(PHSO)
+length(unique(PHSO$EAVE_LINKNO))
+
+PHSO %>%
+  group_by(health_board) %>%
+  summarise(censor_date = max(Treatment_Date))
+
+# Remove duplicated records across sources
+treated <- bind_rows(hepma, PHSO)  %>%
+  arrange(EAVE_LINKNO, Medication,Treatment_Date) %>%
+  group_by(EAVE_LINKNO, Medication,Treatment_Date) %>%
+  slice(1) %>%
+  ungroup
+
+# Split into treatment episodes (/ infections)
+treated<-treated %>% 
+  group_by(EAVE_LINKNO) %>%
+  mutate(time_since_first = Treatment_Date-min(Treatment_Date),
+         first_episode = ifelse(time_since_first<=40,1,0)) %>%
+  group_by(EAVE_LINKNO,first_episode) %>%
+  mutate(time_since_second = Treatment_Date-min(Treatment_Date),
+         second_episode = ifelse(!first_episode & time_since_second<=40,
+                                 1,0),
+         Episode = ifelse(first_episode,1,
+                          ifelse(second_episode,2,3))) %>%
+  ungroup %>%
+  select(-time_since_first,-first_episode, -time_since_second,-second_episode)
+
+# multiple records of the same trt, and episode - keep first by date 
+treated <- treated %>%
+  group_by(EAVE_LINKNO, Medication, Episode) %>%
+  arrange(EAVE_LINKNO, Episode, Medication,Treatment_Date) %>%
+  filter(!(n()>1 & row_number()>1)) %>%
+  # some people have cocktails
+  group_by(EAVE_LINKNO,Episode) %>%
+  mutate(cocktail  = length(unique(Medication))>1)
+
+# It's only considered a cocktail if they were initiated within 3 days of eachother, 
+# else I consider it a secondary treatment
+cocktails<- treated %>%
+  filter(cocktail) %>%
+  group_by(EAVE_LINKNO,Episode) %>% 
+  arrange(Treatment_Date) %>%
+  summarise(cocktail_name = ifelse(as.numeric(max(Treatment_Date)-min(Treatment_Date))<=2,
+                                   "Combination",
+                                   first(Medication))) %>%
+  ungroup
+
+# then need to merge this back in to treated (with only first record per person-episode)
+treated <- treated  %>%
+  group_by(EAVE_LINKNO,Episode) %>%
+  arrange(EAVE_LINKNO, Episode, Treatment_Date) %>%
+  slice(1) %>%
+  ungroup   %>%
+  left_join(cocktails) %>%
+  mutate(Medication = ifelse(cocktail,cocktail_name,Medication)) %>%
+  select(-cocktail,-cocktail_name) 
+
+rm(hepma,PHSO,hepma_max)
+
+nrow(treated)
+length(unique(treated$EAVE_LINKNO))
+
+treated %>% group_by(EAVE_LINKNO) %>% 
+  summarise(eps = max(Episode)) %>% 
+  ungroup %>% count(eps)
+
+```
+
+
+```{r healthcare_setting}
+
+# SMR01 records - who was treated during an admission?
+hosp_treated<-SMR01 %>%
+  select(EAVE_LINKNO, ADMISSION_DATE, DISCHARGE_DATE,covid_main_diag_admit) %>%
+  inner_join(treated %>% select(EAVE_LINKNO, Episode, Treatment_Date))  %>%
+  filter(!(ADMISSION_DATE>Treatment_Date) &
+           !(DISCHARGE_DATE<Treatment_Date) &
+           ADMISSION_DATE!=DISCHARGE_DATE) %>%
+  mutate(healthcare_setting_SMR = ifelse(covid_main_diag_admit==1,"1","2")) %>%
+  group_by(EAVE_LINKNO) %>%
+  arrange(EAVE_LINKNO,healthcare_setting_SMR) %>%
+  slice(1) %>%
+  ungroup()
+  
+# who was treated during a currently uncoded admission   
+rapid_treated<-hosp %>%
+  select(EAVE_LINKNO,admission_date,discharge_date) %>%
+  filter(EAVE_LINKNO %in% treated$EAVE_LINKNO) %>%
+  left_join(treated %>% select(EAVE_LINKNO, Episode, Treatment_Date))  %>%
+  filter(!(admission_date>Treatment_Date) &
+           admission_date!=discharge_date & 
+           (!(discharge_date<Treatment_Date) |
+              is.na(discharge_date))) %>%
+  mutate(healthcare_setting_RAPID = "X")  %>%
+  group_by(EAVE_LINKNO) %>%
+  arrange(EAVE_LINKNO,admission_date) %>%
+  slice(1) %>%
+  ungroup()
+
+# healthcare setting estimation
+treated<-treated %>%
+  left_join(hosp_treated %>% select(EAVE_LINKNO, Episode, healthcare_setting_SMR,
+                                    DISCHARGE_DATE)) %>%
+  left_join(rapid_treated %>% select(EAVE_LINKNO, Episode, healthcare_setting_RAPID,
+                                     discharge_date)) %>%
+  mutate(tt_disc=as.numeric(as.Date(DISCHARGE_DATE)-Treatment_Date),
+         tt_disc2 = as.numeric(as.Date(discharge_date)-Treatment_Date),
+         healthcare_setting = ifelse(is.na(healthcare_setting_SMR),
+                                     ifelse(is.na(healthcare_setting_RAPID),
+                                            "3",  # outpatient
+                                            "4"), # uncoded 
+                                     ifelse(healthcare_setting_SMR=="1",
+                                            "1", # acute
+                                            "2"))) %>% # non-acute
+  select(-healthcare_setting_RAPID,-healthcare_setting_SMR,
+         -DISCHARGE_DATE,-discharge_date) 
+
+rm(rapid_treated,hosp_treated)
+
+# recode 'community' treatments for acute drugs
+nrow(treated %>% filter(Medication %in% c("Sarilumab","Tocilizumab") & 
+                          healthcare_setting==3))
+
+treated<-treated %>%
+  filter(!(Medication %in% c("Tocilizumab","Sarilumab") &
+                                       healthcare_setting==3)) 
+
+
+```
+
+
+
+```{r later_testing}
+
+# PCR testing data 
+cdw_after<- treated %>% 
+  left_join(cdw) %>% 
+  select(EAVE_LINKNO, Episode,Medication,Treatment_Date,
+         date_ecoss_specimen,test_result) %>% 
+  filter(date_ecoss_specimen>Treatment_Date & 
+           date_ecoss_specimen<(Treatment_Date+40)) %>%
+  mutate(days_after = as.numeric(as.Date(date_ecoss_specimen) - Treatment_Date))
+
+treated <- treated %>%
+  left_join(cdw_after %>%
+              filter(test_result=="NEGATIVE") %>%
+              group_by(EAVE_LINKNO,Episode) %>%
+              summarise(first_negative_PCR = min(days_after))) 
+
+#how many episodes with negative PCR on date of treatment?
+sum(treated$first_negative_PCR==0, na.rm=T)
+sum(treated$first_negative_PCR==0, na.rm=T)*100/nrow(treated)
+
+#exclude these episodes
+treated<-treated %>% filter(is.na(first_negative_PCR) | first_negative_PCR>0)
+
+rm(cdw_after)
+
+
+```
+
+```{r cohort_results}
+
+nrow(treated)
+length(unique(treated$EAVE_LINKNO))
+
+table(treated$healthcare_setting)
+table(treated$healthcare_setting)*100/nrow(treated)
+```
+
+
+
+```{r time_to_trt}
+
+# Restrict testing extract to no earlier than 28 days before first treatment date:
+period_start <- min(treated$Treatment_Date)-28
+period_end<-max(treated$Treatment_Date)
+
+# PCR testing data 
+cdw_treated<- cdw %>% 
+  filter(test_result == "POSITIVE" & 
+           date_ecoss_specimen >= period_start & 
+           EAVE_LINKNO %in% treated$EAVE_LINKNO) %>% 
+  select(EAVE_LINKNO, date_ecoss_specimen) %>% 
+  mutate(test_type = "PCR",
+         date_ecoss_specimen = as.Date(date_ecoss_specimen))
+
+# Read in LFT tests in case some tests were not PCR:
+lfts_treated <- lfts %>% 
+  mutate(date_ecoss_specimen = as.Date(date_ecoss_specimen)) %>% 
+  select(EAVE_LINKNO, date_ecoss_specimen) %>% 
+  filter(EAVE_LINKNO %in% treated$EAVE_LINKNO & 
+           date_ecoss_specimen >= period_start) %>%
+  mutate(test_type = "LFT")
+
+# Diagnosed in hospital
+hosp_diag_treated<- SMR01 %>%
+  mutate(test_type = "HOSP",
+         date_ecoss_specimen=as.Date(ADMISSION_DATE)) %>%
+  filter(EAVE_LINKNO %in% treated$EAVE_LINKNO & 
+           date_ecoss_specimen>= period_start) %>%
+  gather("Condition","Code",
+         -EAVE_LINKNO,-CIS_MARKER,-ADMISSION_DATE,-DISCHARGE_DATE,
+         -test_type,-date_ecoss_specimen) %>%
+  filter(Code=="U071") %>%
+  distinct(EAVE_LINKNO, date_ecoss_specimen,test_type)
+
+# Join all together
+valid_tests <- left_join(treated %>% select(EAVE_LINKNO,Episode,Treatment_Date), 
+                         as.data.frame(bind_rows(cdw_treated, lfts_treated, hosp_diag_treated)))  %>%
+  filter(Treatment_Date>=date_ecoss_specimen & Treatment_Date<=date_ecoss_specimen+28) %>%
+  group_by(EAVE_LINKNO,Episode,test_type) %>%
+  slice(1) %>% ungroup %>%
+  arrange(EAVE_LINKNO,Episode,date_ecoss_specimen)  %>%
+  group_by(EAVE_LINKNO) %>%
+  mutate(first_positive_test = min(date_ecoss_specimen)) 
+
+treated<- treated %>%
+  left_join(valid_tests  %>%
+              distinct(EAVE_LINKNO,Episode,first_positive_test)) %>%
+  left_join(valid_tests  %>%
+              filter(is.na(test_type) | test_type!="LFT") %>%
+              group_by(EAVE_LINKNO,Episode) %>%
+              summarise(PCR_date = min(date_ecoss_specimen, na.rm = T))) %>%
+  ungroup %>% 
+  mutate(no_test = is.na(first_positive_test)*1,
+         first_positive_test = ifelse(is.na(first_positive_test),Treatment_Date,first_positive_test),
+         test_to_trt = as.numeric(Treatment_Date - PCR_date),
+         test_to_trt_cat = case_when(test_to_trt==0 ~ "0",
+                                     test_to_trt==1 ~ "1",
+                                     test_to_trt<=4 ~ "2-3",
+                                     test_to_trt<=28 ~ "4-28",
+                                     is.na(test_to_trt) ~ "No Test Identified"))
+class(treated$first_positive_test)<-"Date"
+
+rm(valid_tests,lfts,cdw_treated,lfts_treated,hosp_diag_treated,period_end,period_start)
+
+```
+
+```{r demographics_and_vaccs}
+
+# Demographics
+treated<-treated %>%
+  left_join(demog %>% 
+              select(EAVE_LINKNO, ageYear, Sex, simd2020_sc_quintile, ur6_2016_name)) 
+rm(demog)
+
+# Try to fill in missing demographic data from PCR testing records:
+cohort_cdw_demog <- left_join(treated %>% select(EAVE_LINKNO,Treatment_Date), 
+                              cdw %>%
+                                select(EAVE_LINKNO, age, subject_sex, simd2020v2_sc_quintile, 
+                                       ur6_2020,HB_residence,date_ecoss_specimen) %>% 
+                                filter(EAVE_LINKNO %in% treated$EAVE_LINKNO)) %>%
+  filter(date_ecoss_specimen<=Treatment_Date) %>%
+  group_by(EAVE_LINKNO) %>%
+  arrange(EAVE_LINKNO,date_ecoss_specimen) %>%
+  slice(n()) %>%
+  rename(sex = subject_sex,
+         simd = simd2020v2_sc_quintile,
+         ur6 = ur6_2020) %>%
+  mutate(simd = as.numeric(simd)) %>%
+  select(-date_ecoss_specimen) 
+
+treated <- left_join(treated, cohort_cdw_demog) %>% 
+  mutate(Sex = if_else(is.na(Sex),sex,Sex),
+         ageYear = if_else(is.na(ageYear),age,ageYear),  
+         simd2020_sc_quintile = if_else(is.na(simd2020_sc_quintile),
+                                        simd,as.numeric(simd2020_sc_quintile)),
+         simd2020_sc_quintile = ifelse(simd2020_sc_quintile==1,"1 (Most Deprived)",
+                                       ifelse(simd2020_sc_quintile==5,"5 (Least Deprived)",
+                                              as.character(simd2020_sc_quintile))),
+         simd2020_sc_quintile = replace_na(simd2020_sc_quintile,"Missing"),
+         ur6_2016_name = as.numeric(substr(ur6_2016_name,1,1)),
+         ur6_2016_name = replace_na(ur6),
+         ur3 = case_when(ur6_2016_name<=2 ~ "1 (Urban Areas)",
+                         ur6_2016_name<=4 ~ "2 (Small Towns)",
+                         ur6_2016_name<=6 ~ "3 (Rural Areas)",
+                         is.na(ur6_2016_name) ~ "Missing"),
+         health_board = ifelse(is.na(health_board),
+                               str_remove(str_to_title(HB_residence),"Nhs "),
+                               health_board),
+         age_gp = as.character(cut(ageYear,
+                      breaks = c(0, 11,18, 100),
+                      labels = c("0-11","12-18", "19+"))),
+         age_gp2 = as.character(cut(ageYear,
+                      breaks = c(0, 17, 40,60,75,110),
+                      labels = c("0-17", "18-40","41-60","61-75","76+"))),
+         age_gp = replace_na(age_gp,"Unknown"),
+         age_gp2 = replace_na(age_gp2,"Unknown"),
+         Sex = case_when(Sex == "F" | Sex == "Female" ~ "F",
+                         Sex == "M" | Sex == "Male" ~ "M",
+                         is.na(Sex) ~ "Unknown")) %>%
+  select(-c(age:ur6,HB_residence, ur6_2016_name)) 
+rm(cohort_cdw_demog)
+
+# Vaccination Data
+vaccs_cohort<- vaccs %>% 
+  filter(EAVE_LINKNO %in% treated$EAVE_LINKNO) %>%
+  left_join(treated %>% select(EAVE_LINKNO,Episode,Treatment_Date)) %>%
+  filter(vacc_occurence_date<=Treatment_Date) %>%
+  group_by(EAVE_LINKNO,Episode) %>%
+  summarise(vaccines = as.character(max(vacc_dose_number)))
+treated<-  left_join(treated,vaccs_cohort) %>%
+  mutate(vaccines = ifelse(is.na(vaccines) | vaccines<=2,
+                           "0-2 vaccinations",
+                           ifelse(vaccines==3,
+                           "3 vaccinations",
+                           "4+ vaccinations")))
+rm(vaccs,vaccs_cohort)
+
+```
+
+```{r comorbidities}
+organ_codes<-c("C437","C467","E538","E539","F081","F082","J011",
+               "J012","J013","J015","J019","J541","J542","J544","J549",
+               "J551","J552","J553","J559","J721","K021","K022",
+               "K026","K029","M011","M012","M013","M014","M015",
+               "M018","M019","M026","M027","M084","M171","M172",
+               "M173","M175","M178","M179","T501","T509","T761",
+               "T768", "T769")
+
+radiotherapy_codes<-c("X654", "X653", "X652", "X651", "X652", "X653",
+                      "X654", "X655", "X656", "X657", "X658", "X659",
+                      "X657", "C823", "M712", "P205", "Y361", "Y352",
+                      "Y351", "Y354", "Y353", "Q151", "Y914", "Y911", 
+                      "Y915", "Y912", "X655", "Y918", "Y368", "Y358", 
+                      "X658", "C824", "M706", "Y363", "C395", "A613", 
+                      "J123", "Y913", "Y919", "Y369", "Y359", "X659")
+
+#OPCS4 Codes
+OPCS4<-OPCS4  %>%
+  # split out multiple codes
+  mutate(main_operation2 = ifelse(nchar(main_operation)==8,
+                                  substr(main_operation,5,8),
+                                  NA),
+         main_operation = ifelse(nchar(main_operation)==8,
+                                 substr(main_operation,1,4),
+                                 main_operation)) %>%
+  gather("operation","code",-EAVE_LINKNO,-date_main_operation) %>%
+  select(-operation) %>%
+  filter(!is.na(code)) %>%
+  # most recent of each code per person
+  group_by(EAVE_LINKNO,code) %>%
+  arrange(EAVE_LINKNO,code,rev(date_main_operation)) %>%
+  slice(1) %>%
+  ungroup() %>%
+  # split code per group (radiotherapy etc.)
+  mutate(code_category = case_when(code %in% c("J699","J709") ~  "splenectomy",
+                                   substr(code,1,3)=="W34" ~ "bone_marrow_transplant",
+                                   code %in% c("W715","W893","X334","X335","X336") ~ "stem_cell_transplant",
+                                   code=="E852" ~ "non_invasive_ventilation",
+                                   substr(code,1,3) %in% c("X70","X71","X72","X73") ~  "chemotherapy",
+                                   code %in% organ_codes ~ "solid_organ_transplant",
+                                   code %in% radiotherapy_codes ~ "radiotherapy")) %>%
+  filter(!is.na(code_category)) %>%
+  distinct(EAVE_LINKNO,code_category) %>%
+  mutate(value = 1) %>%
+  spread(code_category,value) %>%
+  gather(code_category,value,-EAVE_LINKNO) %>%
+  mutate(value = replace_na(value,0)) %>%
+  spread(code_category,value)
+
+# Immune Drugs (BNF 0802)
+immune<-PIS %>%
+  filter(EAVE_LINKNO %in% treated$EAVE_LINKNO) %>%
+   distinct(EAVE_LINKNO) %>%
+  mutate(immune_PIS = 1)
+
+# Organ Transplant complications data for treated
+organ<-SMR01 %>%
+  filter(substr(Main_diag_admit,1,3)=="T86" & 
+           EAVE_LINKNO %in% treated$EAVE_LINKNO) %>%
+  distinct(EAVE_LINKNO) %>%
+  mutate(transplant_SMR01 = 1)
+
+# QCOVID data for treated 
+Q_treated<-treated  %>%
+  distinct(EAVE_LINKNO) %>%
+  left_join(Q %>%
+              filter(EAVE_LINKNO %in% treated$EAVE_LINKNO) %>%
+              mutate(Q_DIAG_CKD = Q_DIAG_CKD_LEVEL>=3,
+                     Q_DOWNS = (Q_LEARN_CAT==2)*1) %>%
+              select(EAVE_LINKNO, Q_DOWNS, Q_BMI, Q_DIAG_CKD, Q_DIAG_BLOOD_CANCER,
+                     Q_DIAG_CIRRHOSIS, Q_DIAG_HIV_AIDS, Q_DIAG_IMMU, Q_DIAG_NEURO, 
+                     Q_DIAG_RA_SLE, Q_DIAG_RESP_CANCER, Q_DIAG_SICKLE_CELL)) %>% 
+  mutate(Q_BMI = ifelse(is.na(Q_BMI) | as.numeric(Q_BMI)>70 | as.numeric(Q_BMI)<5,
+                        NA,as.numeric(Q_BMI))) %>%
+  left_join(organ) %>%
+  left_join(OPCS4) %>%
+  left_join(immune) %>%
+  mutate(Q_DIAG_IMMU = ifelse(Q_DIAG_IMMU==1 | immune_PIS==1,1,0),
+         transplant = ifelse(!is.na(solid_organ_transplant) | !is.na(transplant_SMR01),1,0)) %>%
+  select(-solid_organ_transplant,-transplant_SMR01,-immune_PIS,-non_invasive_ventilation) %>%
+  gather("cat","value",-EAVE_LINKNO,-Q_BMI) %>%
+  group_by(EAVE_LINKNO)  %>%
+  mutate(value = ifelse(is.na(value),0,as.numeric(value)),
+         QSUM = sum(value)) %>%
+  spread(cat,value)
+
+treated<-treated  %>% left_join(Q_treated)
+rm(Q, OPCS4, Q_treated, organ,PIS,immune,organ_codes,radiotherapy_codes,prev_covid,cdw)
+
+# Sequencing record - FIRST within 4 weeks of PCR
+sequencing_cohort<-treated %>%
+  select(EAVE_LINKNO, Episode,first_positive_test) %>%
+  filter(!is.na(first_positive_test)) %>%
+  left_join(sequencing) %>%
+  filter(Collection_Date>=first_positive_test & 
+           Collection_Date<=first_positive_test+28) %>%
+  group_by(EAVE_LINKNO,Episode) %>%
+  slice(1) %>%
+  select(-Collection_Date,-lineage)
+
+treated <- treated %>% 
+  left_join(sequencing_cohort) %>%
+  mutate(VariantShorthand = case_when(VariantShorthand=="NA" ~ "Unsequenced",
+                                      VariantShorthand=="B.1.617.2" ~ "B.1.617.2 (Delta 1)",
+                                      VariantShorthand=="AY.4.2" ~ "AY.4.2 (Delta 2)",
+                                      VariantShorthand %in% c("B.1.1.529","BA.1") ~
+                                        "BA.1 (Omicron 1)", 
+                                      VariantShorthand %in% c("BA.2") ~
+                                        "BA.2 (Omicron 2)",
+                                      VariantShorthand=="BA.3" ~ "BA.3 (Omicron 3)",
+                                       VariantShorthand=="BA.4" ~ "BA.4 (Omicron 4)",
+                                       VariantShorthand=="BA.5" ~ "BA.5 (Omicron 5)",
+                                      VariantShorthand=="BA.2.75" ~ "BA.2.75"),
+         VariantShorthand = replace_na(VariantShorthand,"Unsequenced"))
+rm(sequencing,sequencing_cohort)
+```
+
+```{r table1}
+temp<-treated %>% 
+  ungroup %>%
+  select(healthcare_setting,Medication, ur3, Sex, 
+         simd2020_sc_quintile, age_gp2, vaccines,
+         bone_marrow_transplant, chemotherapy,  
+         Q_DIAG_BLOOD_CANCER, Q_DIAG_CIRRHOSIS, Q_DIAG_CKD, 
+         Q_DIAG_HIV_AIDS, Q_DIAG_IMMU, Q_DIAG_NEURO, Q_DIAG_RA_SLE, 
+         Q_DIAG_RESP_CANCER, Q_DIAG_SICKLE_CELL, Q_DOWNS, radiotherapy, 
+         splenectomy, stem_cell_transplant, transplant) %>%
+  add_count(healthcare_setting, name="total") %>%
+  gather("variable","level", -healthcare_setting,-total) %>%
+  count(healthcare_setting,total,variable, level) %>%
+  mutate(level = ifelse(is.na(level),"Missing",level),
+         perc = ifelse(n<5,
+                       ifelse(level=="Missing",
+                              " (<0.1%)",
+                              ""),
+                       paste0(" (",round(n*100/total,1),"%)")),
+         label = ifelse(n<5,
+                        paste0("<5/",total,perc),
+                        paste0(n,"/",total,perc))) %>%
+  select(healthcare_setting,variable, level, label) %>%
+  spread(healthcare_setting,label) %>%
+  filter(level!=0)
+  
+knitr::kable(temp, booktabs=F) %>%
+  kable_styling(latex_options = c("striped","hold_position")) 
+rm(temp)
+
+```
+
+```{r table1_v2}
+temp<-treated %>% 
+  ungroup %>%
+  filter(healthcare_setting==3 &
+           Medication %in% c("Sotrovimab","Molnupiravir","Paxlovid")) %>%
+  select(Medication, bone_marrow_transplant, chemotherapy,  
+         Q_DIAG_BLOOD_CANCER, Q_DIAG_CIRRHOSIS, Q_DIAG_CKD, 
+         Q_DIAG_HIV_AIDS, Q_DIAG_IMMU, Q_DIAG_NEURO, Q_DIAG_RA_SLE, 
+         Q_DIAG_RESP_CANCER, Q_DIAG_SICKLE_CELL, Q_DOWNS, radiotherapy, 
+         splenectomy, stem_cell_transplant, transplant)
+
+temp %>% count(Medication)
+temp<-temp %>%
+  add_count(Medication, name="total") %>%
+  gather("variable","level", -Medication,-total) %>%
+  count(Medication,total,variable, level) %>%
+  mutate(level = ifelse(is.na(level),"Missing",level),
+         perc = ifelse(n<5,
+                       ifelse(level=="Missing",
+                              " (<0.1%)",
+                              ""),
+                       paste0(" (",round(n*100/total,1),"%)")),
+         label = ifelse(n<5,
+                        paste0("<5",perc),
+                        paste0(n,perc))) %>%
+  select(Medication,variable, level, label) %>%
+  spread(Medication,label) %>%
+  filter(level!=0)
+  
+knitr::kable(temp, booktabs=F) %>%
+  kable_styling(latex_options = c("striped","hold_position")) 
+rm(temp)
+
+```
+
+```{r plot2}
+treated_wk<-treated %>% 
+  filter(healthcare_setting!=4) %>%
+  mutate(week = paste0(year(Treatment_Date),"_",
+                       strftime(Treatment_Date, format = "%V")),
+         week = ifelse(week %in% c("2022_52","2021_53"),
+                       "2022_01",week)) %>%
+  group_by(healthcare_setting,Medication) %>%
+  count(week,name="treated") %>%
+  group_by(healthcare_setting,week) %>%
+  mutate(week_total = sum(treated),
+         perc = treated*100/week_total,
+         healthcare_setting = case_when(healthcare_setting=="1" ~ 
+                                          "Group 1: \nHospitalised for \nAcute COVID-19",
+                                      healthcare_setting=="2" ~ 
+                                        "Group 2: \nHospital-Onset \nor Concurrent \nCOVID-19",
+                                      healthcare_setting=="3" ~ 
+                                        "Group 3: \nNon-Hospitalised"))
+
+treated_wk<-treated_wk %>%
+  filter(week_total>=5)
+
+write.csv(treated_wk,file="treated_wk.csv")
+
+ggplot(treated_wk %>% 
+         mutate(Medication = ifelse(Medication=="Paxlovid","Nirmatrelvir/Ritonavir",Medication))) +
+  geom_bar(aes(x=week, y=perc,fill=Medication),
+           position = "stack",stat="identity") +
+  theme_bw() + ylab("Treatment Proportion by Week") + 
+  xlab("Week of Treatment Initiation") +
+  scale_fill_manual(values=c(met.brewer("Hiroshige",7),"black")) +
+  labs(fill = "Treatment") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 1, hjust=1)) +
+  facet_grid(vars(healthcare_setting))
+
+rm(treated_wk)
+```
+
+```{r seq_results}
+treated %>% 
+  add_count(VariantShorthand,name="var") %>%
+  count(Medication,VariantShorthand,var,name="varmed") %>%
+  mutate(varmed = ifelse(varmed<5,
+                         paste0("<5/",var),
+                         paste0(varmed,"/",var, 
+                         " (",
+                         round(varmed*100/var,1),"%)"))) %>%
+  select(-var) %>%
+  spread(VariantShorthand,varmed)
+
+treated<-treated %>%
+  mutate(index_date = if_else(is.na(first_positive_test),
+                              Treatment_Date,
+                              first_positive_test),
+         variant_period = case_when(index_date<=as.Date("28/02/2022",format="%d/%m/%Y") ~ "BA.1",
+                                    index_date<=as.Date("31/05/2022",format="%d/%m/%Y") ~ "BA.2",
+                                    index_date<=as.Date("28/11/2022",format="%d/%m/%Y") ~ "BA.5"))
+
+
+treated %>% count(variant_period, VariantShorthand) %>% spread(variant_period,n)
+
+treated %>% 
+  add_count(variant_period,name="var") %>%
+  count(Medication,variant_period,var,name="varmed") %>%
+  mutate(varmed = ifelse(varmed<5,
+                         paste0("<5/",var),
+                         paste0(varmed,"/",var, 
+                         " (",
+                         round(varmed*100/var,1),"%)"))) %>%
+  select(-var) %>%
+  spread(variant_period,varmed)
+
+
+```
+
+Note that here for SMR01, unlike ICU and deaths outcomes, the minimum follow-up is 42 (28*1.5).
+This followup threshold was extended, as there is an unpredictable lag in SMR01 reporting, 
+based on discharge date, unlike the other two datasets.
+It makes it less likely we are classifying someone as having no outcome when it was simply yet to be reported
+But not so long that we lose a lot of patients, particularly those with more recent variants. 
+
+```{r outcomes_SMR01}
+
+# marker for 42 days of followup in SMR01
+treated<-treated %>%
+  mutate(fup_SMR = as.numeric(as.Date(max(SMR01$ADMISSION_DATE))  - Treatment_Date),
+         base_SMR=  fup_SMR>=42 & 
+           (is.na(tt_disc) | tt_disc>28) & (is.na(tt_disc2) | tt_disc2>28))
+
+# Hospitalisation outcomes
+SMR_outcomes<-SMR01 %>%
+  filter(covid_main_diag_admit==1) %>% 
+  mutate(ADMISSION_DATE=as.Date(ADMISSION_DATE), 
+         DISCHARGE_DATE=as.Date(DISCHARGE_DATE)) %>%
+  select(EAVE_LINKNO,ADMISSION_DATE,DISCHARGE_DATE) %>%
+  inner_join(treated %>% select(EAVE_LINKNO, Episode,Treatment_Date)) %>%
+  filter(ADMISSION_DATE>Treatment_Date & 
+           as.numeric(ADMISSION_DATE - Treatment_Date)<=28 &
+           # only overnights
+           ADMISSION_DATE!=DISCHARGE_DATE) %>%
+  group_by(EAVE_LINKNO,Episode) %>%
+  arrange(EAVE_LINKNO,Episode,ADMISSION_DATE) %>%
+  slice(1) %>%
+  mutate(COV_Admission = 1,
+         tt_COV_Admission = as.numeric(ADMISSION_DATE-Treatment_Date)) %>%
+  select(EAVE_LINKNO,Episode,COV_Admission,tt_COV_Admission) 
+
+treated <- left_join(treated,SMR_outcomes) %>%
+  mutate(COV_Admission = ifelse(is.na(COV_Admission),0,COV_Admission),
+         base_SMR = ifelse(COV_Admission,1,base_SMR))
+
+
+rm(SMR_outcomes,SMR01)
+
+```
+
+```{r outcomes_hosp}
+
+# marker for 28 days of followup in RAPID
+treated<-treated %>%
+  mutate(base_RAPID =  as.numeric(as.Date(max(hosp$admission_date))  - Treatment_Date)>=28 &
+           (is.na(tt_disc) | tt_disc>28) & (is.na(tt_disc2) | tt_disc2>28))
+
+# Hospitalisation outcomes
+RAPID_outcomes<-hosp %>%
+  select(EAVE_LINKNO,admission_date,discharge_date) %>%
+  inner_join(treated %>% select(EAVE_LINKNO, Episode,Treatment_Date)) %>%
+  filter(admission_date>Treatment_Date & 
+           as.numeric(admission_date - Treatment_Date)<=28 &
+           # only overnights
+           admission_date!=discharge_date) %>%
+  distinct(EAVE_LINKNO,Episode) %>%
+  mutate(Admission = 1)
+treated <- left_join(treated,RAPID_outcomes) %>%
+  mutate(Admission = ifelse(is.na(Admission),0,Admission),
+         base_RAPID = ifelse(Admission,1,base_RAPID))
+
+rm(hosp,RAPID_outcomes)
+
+```
+
+
+
+```{r outcomes_deaths}
+
+# marker for 28 days of followup in mortality data
+treated<-treated %>%
+  mutate(base_deaths =  as.numeric(as.Date(max(deaths$NRS.Date.Death))  - Treatment_Date)>=28)
+
+# Deaths outcomes
+deaths_outcomes<-deaths %>%
+  mutate(NRS.Date.Death=as.Date(NRS.Date.Death)) %>%
+  select(EAVE_LINKNO,NRS.Date.Death,UNDERLYING_CAUSE_OF_DEATH) %>%
+  inner_join(treated %>% select(EAVE_LINKNO, Episode,Treatment_Date)) %>%
+  filter(NRS.Date.Death>Treatment_Date & 
+           as.numeric(NRS.Date.Death - Treatment_Date)<=28) %>%
+  distinct(EAVE_LINKNO,Episode,UNDERLYING_CAUSE_OF_DEATH) %>%
+  mutate(Death = 1,
+         COVID_Death = ifelse(UNDERLYING_CAUSE_OF_DEATH %in% c("U071","U072"),1,0))  %>%
+  group_by(EAVE_LINKNO,Episode) %>%
+  filter(COVID_Death==max(COVID_Death)) %>%
+  distinct(EAVE_LINKNO,Episode,Death,COVID_Death)
+treated <- left_join(treated,deaths_outcomes) %>%
+  mutate(Death = ifelse(is.na(Death),0,Death),
+         COVID_Death = ifelse(is.na(COVID_Death),0,COVID_Death),
+         base_deaths = ifelse(Death,1,base_deaths))
+
+rm(deaths,deaths_outcomes)
+
+```
+
+```{r outcomes_ICU}
+
+# marker for 28 days of followup in ICU
+treated<-treated %>%
+  mutate(base_ICU =  as.numeric(as.Date(max(ICUe$AdmitUnit))  - Treatment_Date)>=28)
+
+# ICU outcomes
+ICU_outcomes<-ICUe %>%
+  mutate(AdmitUnit=as.Date(AdmitUnit)) %>%
+  select(EAVE_LINKNO,AdmitUnit,PrimeDiagUnit) %>%
+  inner_join(treated %>% select(EAVE_LINKNO, Episode,Treatment_Date)) %>%
+  filter(AdmitUnit>Treatment_Date & 
+           as.numeric(AdmitUnit - Treatment_Date)<=28)  %>%
+  mutate(ICU = 1,
+         COVID_ICU = ifelse(PrimeDiagUnit==672,1,0)) %>%
+  group_by(EAVE_LINKNO,Episode) %>%
+  filter(COVID_ICU==max(COVID_ICU)) %>%
+  distinct(EAVE_LINKNO,Episode,ICU,COVID_ICU)
+treated <- left_join(treated,ICU_outcomes) %>%
+  mutate(ICU = ifelse(is.na(ICU),0,ICU),
+         COVID_ICU = ifelse(is.na(COVID_ICU),0,COVID_ICU),
+         base_ICU = ifelse(ICU,1,base_ICU))
+
+rm(ICUe,ICU_outcomes)
+
+```
+
+```{r outcomes_any}
+treated<-treated %>%
+  ungroup %>%
+  mutate(any_COV_outcome = 1*((COVID_ICU+COVID_Death+COV_Admission)>0))
+
+```
+
+## Results
+
+The following tables show the number of people with outcomes within 28 days, out of those with at least 42 days of follow-up (or the outcome within 28 days).
+
+```{r outcomes_results}
+
+treated %>%
+  filter(base_SMR==1) %>%
+  summarise(C_outcome_n = sum(any_COV_outcome),
+            base = n(),
+            C_outcome_p = sum(any_COV_outcome)*100/n(),
+            low = round(100*binconf(x=sum(any_COV_outcome),n=n())[2],1),
+            high = round(100*binconf(x=sum(any_COV_outcome),n=n())[3],1))
+
+treated %>%
+  filter(base_SMR==1) %>%
+  summarise(C_Admission_n = sum(COV_Admission),
+            base = n(),
+            C_Admission_p = sum(COV_Admission)*100/n(),
+            low = round(100*binconf(x=sum(COV_Admission),n=n())[2],1),
+            high = round(100*binconf(x=sum(COV_Admission),n=n())[3],1))
+
+treated %>%
+  filter(base_RAPID==1) %>%
+  summarise(Admission_n = sum(Admission),
+            base = n(),
+            Admission_p = sum(Admission)*100/n(),
+            low = round(100*binconf(x=sum(Admission),n=n())[2],1),
+            high = round(100*binconf(x=sum(Admission),n=n())[3],1))
+
+treated %>%
+  filter(base_deaths==1) %>%
+  summarise(Death_n = sum(Death),
+            C_Death_n = sum(COVID_Death),
+            base = n(),
+            Death_p = sum(Death)*100/n(),
+            C_Death_p = sum(COVID_Death)*100/n(),
+            low = round(100*binconf(x=sum(Death),n=n())[2],1),
+            high = round(100*binconf(x=sum(Death),n=n())[3],1),
+            clow = round(100*binconf(x=sum(COVID_Death),n=n())[2],1),
+            chigh = round(100*binconf(x=sum(COVID_Death),n=n())[3],1))
+
+treated %>%
+  filter(base_ICU==1) %>%
+  summarise(ICU_n = sum(ICU),
+            C_ICU_n = sum(COVID_ICU),
+            base = n(),
+            ICU_p = sum(ICU)*100/n(),
+            C_ICU_p = sum(COVID_ICU)*100/n(),
+            low = round(100*binconf(x=sum(ICU),n=n())[2],1),
+            high = round(100*binconf(x=sum(ICU),n=n())[3],1),
+            clow = round(100*binconf(x=sum(COVID_ICU),n=n())[2],1),
+            chigh = round(100*binconf(x=sum(COVID_ICU),n=n())[3],1))
+
+```
+
+The same, stratified by healthcare setting. 
+
+
+```{r outcomes_HC_results}
+
+treated %>%
+  group_by(healthcare_setting) %>%
+  filter(base_SMR==1) %>%
+  summarise(label = paste0(sum(any_COV_outcome),"/",
+                           n()," (",
+                           round(sum(any_COV_outcome)*100/n(),1),
+                           "%) [",
+                           round(100*binconf(x=sum(any_COV_outcome),n=n())[2],1),
+                           "-",
+                           round(100*binconf(x=sum(any_COV_outcome),n=n())[3],1),
+                           "%]")) 
+
+treated %>%
+  group_by(healthcare_setting) %>%
+  filter(base_SMR==1) %>%
+  summarise(label = paste0(sum(COV_Admission),"/",
+                           n()," (",
+                           round(sum(COV_Admission)*100/n(),1),
+                           "%) [",
+                           round(100*binconf(x=sum(COV_Admission),n=n())[2],1),
+                           "-",
+                           round(100*binconf(x=sum(COV_Admission),n=n())[3],1),
+                           "%]")) 
+
+treated %>%
+  group_by(healthcare_setting) %>%
+  filter(base_RAPID==1) %>%
+  summarise(label = paste0(sum(Admission),"/",
+                           n()," (",
+                           round(sum(Admission)*100/n(),1),
+                           "%) [",
+                           round(100*binconf(x=sum(Admission),n=n())[2],1),
+                           "-",
+                           round(100*binconf(x=sum(Admission),n=n())[3],1),
+                           "%]"))
+
+treated %>%
+  group_by(healthcare_setting) %>%
+  filter(base_deaths==1) %>%
+  summarise(death = paste0(sum(Death),"/",
+                           n()," (",
+                           round(sum(Death)*100/n(),1),
+                           "%) [",
+                           round(100*binconf(x=sum(Death),n=n())[2],1),
+                           "-",
+                           round(100*binconf(x=sum(Death),n=n())[3],1),
+                           "%]"),
+            covid_death = paste0(sum(COVID_Death),"/",
+                           n()," (",
+                           round(sum(COVID_Death)*100/n(),1),
+                           "%) [",
+                           round(100*binconf(x=sum(COVID_Death),n=n())[2],1),
+                           "-",
+                           round(100*binconf(x=sum(COVID_Death),n=n())[3],1),
+                           "%]"))
+
+treated %>%
+  group_by(healthcare_setting) %>%
+  filter(base_ICU==1) %>%
+  summarise(ICU = ifelse(n()<5,
+                         paste0("<5/",n()),
+                         paste0(sum(ICU),"/",
+                           n()," (",
+                           round(sum(ICU)*100/n(),1),
+                           "%) [",
+                           round(100*binconf(x=sum(ICU),n=n())[2],1),
+                           "-",
+                           round(100*binconf(x=sum(ICU),n=n())[3],1),
+                           "%]")),
+            CICU = ifelse(n()<5,
+                         paste0("<5/",n()),
+                         paste0(sum(COVID_ICU),"/",
+                           n()," (",
+                           round(sum(COVID_ICU)*100/n(),1),
+                           "%) [",
+                           round(100*binconf(x=sum(COVID_ICU),n=n())[2],1),
+                           "-",
+                           round(100*binconf(x=sum(COVID_ICU),n=n())[3],1),
+                           "%]")))
+  
+```
+
+Admissions, deaths, and ICU admission incidence by healthcare setting and treatment
+
+```{r outcomes_HC_med}
+
+treated %>% 
+  filter(base_RAPID==1) %>%
+  group_by(healthcare_setting,Medication) %>%
+  summarise(Admission = ifelse(sum(Admission)<5,
+                               paste0("<5/",n()),
+                               paste0(sum(Admission),"/",
+                                      n()," (",
+                                      round(sum(Admission)*100/n(),1),
+                                      "%) [",
+                                      round(100*binconf(x=sum(Admission),n=n())[2],1),
+                                      "-",
+                                      round(100*binconf(x=sum(Admission),n=n())[3],1),
+                                      "%]"))) %>%
+  spread(healthcare_setting,Admission)
+
+treated %>% 
+  filter(base_SMR==1) %>%
+  group_by(healthcare_setting,Medication) %>%
+  summarise(any_COV_outcome = ifelse(sum(any_COV_outcome)<5,
+                                   paste0("<5/",n()),
+                                   paste0(sum(any_COV_outcome),"/",
+                                          n()," (",
+                                          round(sum(any_COV_outcome)*100/n(),1),
+                                          "%) [",
+                                          round(100*binconf(x=sum(any_COV_outcome),n=n())[2],1),
+                                          "-",
+                                          round(100*binconf(x=sum(any_COV_outcome),n=n())[3],1),
+                                          "%]"))) %>%
+  spread(healthcare_setting,any_COV_outcome)
+
+treated %>% 
+  filter(base_SMR==1) %>%
+  group_by(healthcare_setting,Medication) %>%
+  summarise(COV_Admission = ifelse(sum(COV_Admission)<5,
+                                   paste0("<5/",n()),
+                                   paste0(sum(COV_Admission),"/",
+                                          n()," (",
+                                          round(sum(COV_Admission)*100/n(),1),
+                                          "%) [",
+                                          round(100*binconf(x=sum(COV_Admission),n=n())[2],1),
+                                          "-",
+                                          round(100*binconf(x=sum(COV_Admission),n=n())[3],1),
+                                          "%]"))) %>%
+  spread(healthcare_setting,COV_Admission)
+
+treated %>% 
+  filter(base_deaths==1) %>%
+  group_by(healthcare_setting,Medication) %>%
+  summarise(Death = paste0(sum(Death),"/",
+                           n()," (",
+                           round(sum(Death)*100/n(),1),
+                           "%) [",
+                           round(100*binconf(x=sum(Death),n=n())[2],1),
+                           "-",
+                           round(100*binconf(x=sum(Death),n=n())[3],1),
+                           "%]")) %>%
+  spread(healthcare_setting,Death)
+
+treated %>% 
+  filter(base_deaths==1) %>%
+  group_by(healthcare_setting,Medication) %>%
+  summarise(COVID_Death = paste0(sum(COVID_Death),"/",
+                                 n()," (",
+                                 round(sum(COVID_Death)*100/n(),1),
+                                 "%) [",
+                                 round(100*binconf(x=sum(COVID_Death),n=n())[2],1),
+                                 "-",
+                                 round(100*binconf(x=sum(COVID_Death),n=n())[3],1),
+                                 "%]")) %>%
+  spread(healthcare_setting,COVID_Death)
+
+
+treated %>% 
+  filter(base_ICU==1) %>%
+  group_by(healthcare_setting,Medication) %>%
+  summarise(ICU = ifelse(sum(ICU)<5,
+                                   paste0("<5/",n()),
+                                   paste0(sum(ICU),"/",
+                                          n()," (",
+                                          round(sum(ICU)*100/n(),1),
+                                          "%) [",
+                                          round(100*binconf(x=sum(ICU),n=n())[2],1),
+                                          "-",
+                                          round(100*binconf(x=sum(ICU),n=n())[3],1),
+                                          "%]"))) %>%
+  spread(healthcare_setting,ICU)
+
+treated %>% 
+  filter(base_ICU==1) %>%
+  group_by(healthcare_setting,Medication) %>%
+  summarise(COVID_ICU = ifelse(sum(COVID_ICU)<5,
+                                   paste0("<5/",n()),
+                                   paste0(sum(COVID_ICU),"/",
+                                          n()," (",
+                                          round(sum(COVID_ICU)*100/n(),1),
+                                          "%) [",
+                                          round(100*binconf(x=sum(COVID_ICU),n=n())[2],1),
+                                          "-",
+                                          round(100*binconf(x=sum(COVID_ICU),n=n())[3],1),
+                                          "%]"))) %>%
+  spread(healthcare_setting,COVID_ICU)
+
+
+
+```
+
+
+
+```{r main_table_admission_comorbs}
+
+d<-treated %>% 
+  filter(base_SMR==1 & healthcare_setting==3) %>% 
+  mutate(no_coms = (QSUM==0))
+
+table(d$no_coms)
+x<-glm(any_COV_outcome ~ no_coms, 
+    data = d,family = binomial)
+round(exp(x$coefficients[2]),3)
+round(summary(x)$coefficients[2,4],3)
+round(exp(confint.default(x)[2,]),3)
+
+table(d$bone_marrow_transplant)
+x<-glm(any_COV_outcome ~ bone_marrow_transplant, 
+    data = d, family = binomial)
+round(exp(x$coefficients[2]),3)
+round(summary(x)$coefficients[2,4],3)
+round(exp(confint.default(x)[2,]),3)
+
+table(d$chemotherapy)
+x<-glm(any_COV_outcome ~ chemotherapy, 
+    data = d, family = binomial)
+round(exp(x$coefficients[2]),3)
+round(summary(x)$coefficients[2,4],3)
+round(exp(confint.default(x)[2,]),3)
+
+table(d$Q_DIAG_BLOOD_CANCER)
+x<-glm(any_COV_outcome ~ Q_DIAG_BLOOD_CANCER, 
+    data = d, family = binomial)
+round(exp(x$coefficients[2]),3)
+round(summary(x)$coefficients[2,4],3)
+round(exp(confint.default(x)[2,]),3)
+
+table(d$Q_DIAG_CIRRHOSIS)
+x<-glm(any_COV_outcome ~ Q_DIAG_CIRRHOSIS, 
+    data = d, family = binomial)
+round(exp(x$coefficients[2]),3)
+round(summary(x)$coefficients[2,4],3)
+round(exp(confint.default(x)[2,]),3)
+
+table(d$Q_DIAG_CKD)
+x<-glm(any_COV_outcome ~ Q_DIAG_CKD, 
+    data = d, family = binomial)
+round(exp(x$coefficients[2]),3)
+round(summary(x)$coefficients[2,4],3)
+round(exp(confint.default(x)[2,]),3)
+
+table(d$Q_DIAG_HIV_AIDS)
+x<-glm(any_COV_outcome ~ Q_DIAG_HIV_AIDS, 
+    data = d, family = binomial)
+round(exp(x$coefficients[2]),3)
+round(summary(x)$coefficients[2,4],3)
+round(exp(confint.default(x)[2,]),3)
+
+table(d$Q_DIAG_IMMU)
+x<-glm(any_COV_outcome ~ Q_DIAG_IMMU, 
+    data = d, family = binomial)
+round(exp(x$coefficients[2]),3)
+round(summary(x)$coefficients[2,4],3)
+round(exp(confint.default(x)[2,]),3)
+
+table(d$Q_DIAG_NEURO)
+x<-glm(any_COV_outcome ~ Q_DIAG_NEURO, 
+    data = d, family = binomial)
+round(exp(x$coefficients[2]),3)
+round(summary(x)$coefficients[2,4],3)
+round(exp(confint.default(x)[2,]),3)
+
+table(d$Q_DIAG_RA_SLE)
+x<-glm(any_COV_outcome ~ Q_DIAG_RA_SLE, 
+    data = d, family = binomial)
+round(exp(x$coefficients[2]),3)
+round(summary(x)$coefficients[2,4],3)
+round(exp(confint.default(x)[2,]),3)
+
+table(d$Q_DIAG_RESP_CANCER)
+x<-glm(any_COV_outcome ~ Q_DIAG_RESP_CANCER, 
+    data = d, family = binomial)
+round(exp(x$coefficients[2]),3)
+round(summary(x)$coefficients[2,4],3)
+round(exp(confint.default(x)[2,]),3)
+
+table(d$Q_DIAG_SICKLE_CELL)
+x<-glm(any_COV_outcome ~ Q_DIAG_SICKLE_CELL, 
+    data = d, family = binomial)
+round(exp(x$coefficients[2]),3)
+round(summary(x)$coefficients[2,4],3)
+round(exp(confint.default(x)[2,]),3)
+
+table(d$Q_DOWNS)
+x<-glm(any_COV_outcome ~ Q_DOWNS, 
+    data = d, family = binomial)
+round(exp(x$coefficients[2]),3)
+round(summary(x)$coefficients[2,4],3)
+round(exp(confint.default(x)[2,]),3)
+
+table(d$radiotherapy)
+x<-glm(any_COV_outcome ~ radiotherapy, 
+    data = d, family = binomial)
+round(exp(x$coefficients[2]),3)
+round(summary(x)$coefficients[2,4],3)
+round(exp(confint.default(x)[2,]),3)
+
+table(d$splenectomy)
+x<-glm(any_COV_outcome ~ splenectomy, 
+    data = d, family = binomial)
+round(exp(x$coefficients[2]),3)
+round(summary(x)$coefficients[2,4],3)
+round(exp(confint.default(x)[2,]),3)
+
+table(d$stem_cell_transplant)
+x<-glm(any_COV_outcome ~ stem_cell_transplant, 
+    data = d, family = binomial)
+round(exp(x$coefficients[2]),3)
+round(summary(x)$coefficients[2,4],3)
+round(exp(confint.default(x)[2,]),3)
+
+table(d$transplant)
+x<-glm(any_COV_outcome ~ transplant, 
+    data = d, family = binomial)
+round(exp(x$coefficients[2]),3)
+round(summary(x)$coefficients[2,4],3)
+round(exp(confint.default(x)[2,]),3)
+
+```
+
+```{r main_table_admission_cats}
+
+table(d$age_gp2)
+x<-glm(any_COV_outcome ~ age_gp2, 
+    data = d %>% filter(!age_gp2 %in% c("0-17","Unknown"))
+      , family = binomial)
+round(exp(x$coefficients),3)
+round(summary(x)$coefficients[,4],3)
+round(exp(confint.default(x)),3)
+
+table(d$ur3)
+x<-glm(any_COV_outcome ~ ur3, 
+    data = d, family = binomial)
+round(exp(x$coefficients),3)
+round(summary(x)$coefficients[,4],3)
+round(exp(confint.default(x)),3)
+
+table(d$Sex)
+x<-glm(any_COV_outcome ~ Sex, 
+    data = d %>% filter(Sex!='Unknown'), family = binomial)
+round(exp(x$coefficients),3)
+round(summary(x)$coefficients[,4],3)
+round(exp(confint.default(x)),3)
+
+table(d$simd2020_sc_quintile)
+x<-glm(any_COV_outcome ~ as.numeric(simd2020_sc_quintile), 
+    data = d, family = binomial)
+round(exp(x$coefficients),3)
+round(summary(x)$coefficients[,4],3)
+round(exp(confint.default(x)),3)
+
+table(d$vaccines)
+x<-glm(any_COV_outcome ~ vaccines, 
+    data = d, family = binomial)
+round(exp(x$coefficients),3)
+round(summary(x)$coefficients[,4],3)
+round(exp(confint.default(x)),3)
+
+table(d$test_to_trt_cat)
+x<-glm(any_COV_outcome ~ test_to_trt_cat, 
+    data = d, family = binomial)
+round(exp(x$coefficients),3)
+round(summary(x)$coefficients[,4],3)
+round(exp(confint.default(x)),3)
+```
+
+```{r adjusted_comps}
+
+adj<-treated %>% filter(base_SMR==1 & healthcare_setting==3 &
+                         Sex!="Unknown" & 
+                         !age_gp2 %in% c("0-17","Unknown") & 
+                           Medication %in% c("Sotrovimab",
+                                             "Molnupiravir",
+                                             "Paxlovid"))
+
+x<-glm(any_COV_outcome ~ Medication + age_gp2 + 
+         Sex + vaccines  + transplant + Q_DIAG_BLOOD_CANCER +
+         Q_DIAG_CKD + Q_DIAG_IMMU + Q_DIAG_NEURO + Q_DIAG_RA_SLE, 
+    data =  adj %>% filter(variant_period=="BA.1"),  family = binomial)
+round(exp(summary(x)$coefficients[,1]),3)
+round(summary(x)$coefficients[,4],3)
+round(exp(confint.default(x)[,1:2]),3)
+
+x<-glm(any_COV_outcome ~ Medication + age_gp2 + 
+         Sex + vaccines  + transplant + chemotherapy + Q_DIAG_BLOOD_CANCER +
+         Q_DIAG_CKD + Q_DIAG_IMMU + Q_DIAG_NEURO + Q_DIAG_RA_SLE, 
+    data =  adj %>% filter(variant_period=="BA.2"),  family = binomial)
+round(exp(summary(x)$coefficients[,1]),3)
+round(summary(x)$coefficients[,4],3)
+round(exp(confint.default(x)[,1:2]),3)
+
+x<-glm(any_COV_outcome ~ Medication + age_gp2 + 
+         Sex + vaccines  + transplant + chemotherapy + Q_DIAG_BLOOD_CANCER +
+         Q_DIAG_CKD + Q_DIAG_IMMU + Q_DIAG_NEURO + Q_DIAG_RA_SLE, 
+    data =  adj %>% filter(variant_period=="BA.5"),  family = binomial)
+round(exp(summary(x)$coefficients[,1]),3)
+round(summary(x)$coefficients[,4],3)
+round(exp(confint.default(x)[,1:2]),3)
+
+
+```
+
+```{r adjusted_comps2}
+# change order to get CIs
+adj$Medication <- factor(adj$Medication, levels = c("Sotrovimab","Paxlovid","Molnupiravir"))
+x<-glm(any_COV_outcome ~ Medication + age_gp2 + 
+         Sex + vaccines  + transplant + Q_DIAG_BLOOD_CANCER +
+         Q_DIAG_CKD + Q_DIAG_IMMU + Q_DIAG_NEURO + Q_DIAG_RA_SLE, 
+    data =  adj %>% filter(variant_period=="BA.1"),  family = binomial)
+round(exp(summary(x)$coefficients[,1]),3)
+round(summary(x)$coefficients[,4],3)
+round(exp(confint.default(x)[,1:2]),3)
+
+x<-glm(any_COV_outcome ~ Medication + age_gp2 + 
+         Sex + vaccines  + transplant + chemotherapy + Q_DIAG_BLOOD_CANCER +
+         Q_DIAG_CKD + Q_DIAG_IMMU + Q_DIAG_NEURO + Q_DIAG_RA_SLE, 
+    data =  adj %>% filter(variant_period=="BA.2"),  family = binomial)
+round(exp(summary(x)$coefficients[,1]),3)
+round(summary(x)$coefficients[,4],3)
+round(exp(confint.default(x)[,1:2]),3)
+
+x<-glm(any_COV_outcome ~ Medication + age_gp2 + 
+         Sex + vaccines  + transplant + chemotherapy + Q_DIAG_BLOOD_CANCER +
+         Q_DIAG_CKD + Q_DIAG_IMMU + Q_DIAG_NEURO + Q_DIAG_RA_SLE, 
+    data =  adj %>% filter(variant_period=="BA.5"),  family = binomial)
+round(exp(summary(x)$coefficients[,1]),3)
+round(summary(x)$coefficients[,4],3)
+round(exp(confint.default(x)[,1:2]),3)
+```
+
